@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>IANOS - Asistente de Voz</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      height: 100vh;
+      width: 100%;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    }
+
+    .container {
+      text-align: center;
+    }
+
+    .talk-button {
+      padding: 1.5rem 3rem;
+      font-size: 1.25rem;
+      font-weight: 600;
+      color: #1a1a2e;
+      background: linear-gradient(135deg, #00d4ff 0%, #5b86e5 100%);
+      border: none;
+      border-radius: 50px;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      box-shadow: 0 10px 40px rgba(0, 212, 255, 0.3);
+    }
+
+    .talk-button:hover {
+      transform: translateY(-3px);
+      box-shadow: 0 15px 50px rgba(0, 212, 255, 0.4);
+    }
+
+    .talk-button:active {
+      transform: translateY(-1px);
+    }
+
+    .talk-button.listening {
+      background: linear-gradient(135deg, #ff6b6b 0%, #ee5a24 100%);
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+
+    .talk-button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    @keyframes pulse {
+      0%, 100% {
+        box-shadow: 0 10px 40px rgba(255, 107, 107, 0.3);
+      }
+      50% {
+        box-shadow: 0 10px 60px rgba(255, 107, 107, 0.5);
+      }
+    }
+
+    .status {
+      margin-top: 1.5rem;
+      color: rgba(255, 255, 255, 0.7);
+      font-size: 0.9rem;
+    }
+
+    .visualizer {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 4px;
+      height: 40px;
+      margin-top: 1.5rem;
+      opacity: 0;
+      transition: opacity 0.3s ease;
+    }
+
+    .visualizer.active {
+      opacity: 1;
+    }
+
+    .visualizer-bar {
+      width: 4px;
+      height: 10px;
+      background: #00d4ff;
+      border-radius: 2px;
+      animation: visualize 0.5s ease-in-out infinite;
+    }
+
+    .visualizer-bar:nth-child(1) { animation-delay: 0s; }
+    .visualizer-bar:nth-child(2) { animation-delay: 0.1s; }
+    .visualizer-bar:nth-child(3) { animation-delay: 0.2s; }
+    .visualizer-bar:nth-child(4) { animation-delay: 0.3s; }
+    .visualizer-bar:nth-child(5) { animation-delay: 0.4s; }
+
+    @keyframes visualize {
+      0%, 100% { height: 10px; }
+      50% { height: 30px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <button class="talk-button" id="talkButton">Hablar con IANOS</button>
+    <div class="status" id="status"></div>
+    <div class="visualizer" id="visualizer">
+      <div class="visualizer-bar"></div>
+      <div class="visualizer-bar"></div>
+      <div class="visualizer-bar"></div>
+      <div class="visualizer-bar"></div>
+      <div class="visualizer-bar"></div>
+    </div>
+  </div>
+
+  <script>
+    const PROMPT_ID = 'pmpt_68d2551760ac8194a5c9602eef180ae503c6f334dce7cadd';
+    const PROMPT_VERSION = '5';
+
+    let peerConnection = null;
+    let dataChannel = null;
+    let isConnected = false;
+
+    const talkButton = document.getElementById('talkButton');
+    const status = document.getElementById('status');
+    const visualizer = document.getElementById('visualizer');
+
+    talkButton.addEventListener('click', async () => {
+      if (isConnected) {
+        disconnect();
+      } else {
+        await connect();
+      }
+    });
+
+    async function connect() {
+      try {
+        talkButton.disabled = true;
+        status.textContent = 'Conectando...';
+
+        // Get ephemeral token from your backend
+        const tokenResponse = await fetch('/api/session', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' }
+        });
+
+        if (!tokenResponse.ok) {
+          throw new Error('Error al obtener el token de sesión');
+        }
+
+        const data = await tokenResponse.json();
+        const ephemeralKey = data.client_secret.value;
+
+        // Create peer connection
+        peerConnection = new RTCPeerConnection();
+
+        // Set up audio playback
+        const audioEl = document.createElement('audio');
+        audioEl.autoplay = true;
+        peerConnection.ontrack = (e) => {
+          audioEl.srcObject = e.streams[0];
+        };
+
+        // Get microphone access
+        const mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mediaStream.getTracks().forEach(track => {
+          peerConnection.addTrack(track, mediaStream);
+        });
+
+        // Set up data channel for events
+        dataChannel = peerConnection.createDataChannel('oai-events');
+        dataChannel.onmessage = handleServerEvent;
+
+        // Create and set local description
+        const offer = await peerConnection.createOffer();
+        await peerConnection.setLocalDescription(offer);
+
+        // Connect to OpenAI Realtime API
+        const baseUrl = 'https://api.openai.com/v1/realtime';
+        const model = 'gpt-4o-realtime-preview';
+
+        const sdpResponse = await fetch(`${baseUrl}?model=${model}`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${ephemeralKey}`,
+            'Content-Type': 'application/sdp'
+          },
+          body: offer.sdp
+        });
+
+        if (!sdpResponse.ok) {
+          throw new Error('Error al conectar con OpenAI');
+        }
+
+        const answerSdp = await sdpResponse.text();
+        await peerConnection.setRemoteDescription({
+          type: 'answer',
+          sdp: answerSdp
+        });
+
+        isConnected = true;
+        talkButton.disabled = false;
+        talkButton.textContent = 'Finalizar';
+        talkButton.classList.add('listening');
+        status.textContent = 'Escuchando...';
+        visualizer.classList.add('active');
+
+      } catch (error) {
+        console.error('Error:', error);
+        status.textContent = 'Error: ' + error.message;
+        talkButton.disabled = false;
+        disconnect();
+      }
+    }
+
+    function handleServerEvent(event) {
+      try {
+        const data = JSON.parse(event.data);
+        console.log('Server event:', data);
+
+        switch (data.type) {
+          case 'response.audio_transcript.done':
+            console.log('Assistant:', data.transcript);
+            break;
+          case 'input_audio_buffer.speech_started':
+            status.textContent = 'Escuchando...';
+            break;
+          case 'input_audio_buffer.speech_stopped':
+            status.textContent = 'Procesando...';
+            break;
+          case 'response.done':
+            status.textContent = 'Listo para hablar';
+            break;
+        }
+      } catch (e) {
+        console.error('Error parsing event:', e);
+      }
+    }
+
+    function disconnect() {
+      if (dataChannel) {
+        dataChannel.close();
+        dataChannel = null;
+      }
+      if (peerConnection) {
+        peerConnection.close();
+        peerConnection = null;
+      }
+      isConnected = false;
+      talkButton.textContent = 'Hablar con IANOS';
+      talkButton.classList.remove('listening');
+      talkButton.disabled = false;
+      status.textContent = '';
+      visualizer.classList.remove('active');
+    }
+  </script>
+</body>
+</html>
